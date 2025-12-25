@@ -11,12 +11,17 @@ By utilizing **Qsys** for system integration, the Altera hardware is configured 
 
 ## Key Technical Features
  
-**Central Processor:** Custom **Nios II soft-core processor** implemented on the Altera FPGA fabric, serving as the main processing unit for control logic.
+**Central Processor:** 
+- Custom **Nios II soft-core processor** implemented on the Altera FPGA fabric, serving as the main processing unit for control logic.
 
-**User Interface:** A custom **VGA controller** that outputs a real-time control panel with character buffering to a monitor display.
+**User Interface:** 
+- A custom **VGA controller** that outputs a real-time control panel with character buffering to a monitor display.
 
-**Wireless Connectivity:** **HC-06 Bluetooth module** utilized for transmitting real-time usage history and security notifications directly to the user’s mobile device.
+**Wireless Connectivity:** 
+- **HC-06 Bluetooth module** utilized for transmitting real-time usage history and security notifications directly to the user’s mobile device.
 
-**Safety & Support:** Integrated **emergency call system** using an interrupt-driven push button and buzzer to provide immediate technical assistance.
+**Safety & Support:** 
+- Integrated **emergency call system** using an interrupt-driven push button and buzzer to provide immediate technical assistance.
 
-**Software Stack:** Hardware configuration and system integration were performed using **Quartus II** and **Qsys**, while application logic was developed in C using the **Nios II Software Build Tools for Eclipse**.
+**Software Stack:** 
+- Hardware configuration and system integration were performed using **Quartus II** and **Qsys**, while application logic was developed in C using the **Nios II Software Build Tools for Eclipse**.
