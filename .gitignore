@@ -1,0 +1,34 @@
+# Quartus Prime Project
+db/
+incremental_db/
+output_files/
+simulation/
+greybox_tmp/
+hc_output/
+.qsys_edit/
+unsaved/
+
+# Project Settings & Backups
+*.qws
+*.bak
+*.sof
+*.pof
+*.jdi
+*.pin
+*.qsf.bak
+*.sopcinfo
+/Eclipse/
+
+# Software (Nios II) Artifacts
+software/*/obj/
+software/*/*.elf
+software/*/*.flash
+software/*/*.map
+software/*/*.objdump
+software/*/*.srec
+software/*/html/
+software/*/Makefile
+
+# OS generated
+.DS_Store
+Thumbs.db

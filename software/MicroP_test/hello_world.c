@@ -1,0 +1,1609 @@
+#include "system.h"   // Include system definitions
+#include "io.h"       // For memory-mapped I/O functions
+#include "sys/alt_stdio.h"
+#include "unistd.h"
+#include "altera_avalon_uart.h"  // UART driver library
+#include "altera_avalon_uart_regs.h"
+#include "altera_avalon_pio_regs.h"
+#include "sys/alt_irq.h"
+#include "alt_types.h"
+#include <string.h>
+#include <stdint.h>
+#include "sys/alt_timestamp.h"
+#include "altera_avalon_timer_regs.h"
+#include <stdbool.h>
+#include <altera_avalon_spi.h>
+
+
+#define SPI_MASTER_BASE 0x10000 // Base address for SPI
+#define SPI_CS_BASE 	0x10020	// Base address for CS Pin in GPIO
+
+#define HC_IN_BASE  0x10030  // Trigger pin base address
+#define HC_OUT_BASE 0x15030  // Echo pin base address
+
+#define TRIGGER_PULSE_WIDTH 10 // Pulse width in microseconds
+#define TIMEOUT_THRESHOLD 1000000  // Timeout threshold (for 1 second)
+
+#define ALPHA 0.35      // Smoothing factor for the low-pass filter
+#define ALPHA_COMPLEMENT 0.65
+#define SCALE_FACTOR 100 // Fixed-Point Arithmetic
+
+// VGA Character Buffer Base Address
+#define VGA_CHAR_BASE VIDEO_CHARACTER_BUFFER_WITH_DMA_0_AVALON_CHAR_BUFFER_SLAVE_BASE
+#define VGA_COLOR_BASE VIDEO_CHARACTER_BUFFER_WITH_DMA_0_AVALON_CHAR_CONTROL_SLAVE_BASE
+#define UART_BASE 0x15000
+#define BUTTON_INT_BASE 0x15050
+#define BUZZER_BASE 0x15040
+#define KEYPAD_ROW_BASE 0x15020
+#define KEYPAD_COLUMN_BASE 0x15060
+#define BUTTON_INT_IRQ_INTERRUPT_CONTROLLER_ID 0
+#define BUTTON_INT_IRQ 2
+#define TRIGGER_PIN 0
+#define ECHO_PIN 1
+#define LOCKER_STATUS 0x15080
+
+// RC522 Commands
+#define PCD_IDLE                  0x00
+#define PCD_AUTHENT               0x0E
+#define PCD_RECEIVE               0x08
+#define PCD_TRANSMIT              0x04
+#define PCD_TRANSCEIVE            0x0C
+#define PCD_RESETPHASE            0x0F
+#define PCD_CALCCRC               0x03
+
+// PICC Commands
+#define PICC_REQIDL               0x26
+#define PICC_REQALL               0x52
+#define PICC_ANTICOLL             0x93
+#define PICC_SELECTTAG            0x93
+#define PICC_HALT                 0x50
+
+// RC522 Registers
+#define MFRC522_REG_COMMAND        0x01
+#define MFRC522_REG_COMIEN         0x02
+#define MFRC522_REG_DIVIEN         0x03
+#define MFRC522_REG_COMIRQ         0x04
+#define MFRC522_REG_DIVIRQ         0x05
+#define MFRC522_REG_ERROR          0x06
+#define MFRC522_REG_STATUS1        0x07
+#define MFRC522_REG_STATUS2        0x08
+#define MFRC522_REG_FIFO_DATA      0x09
+#define MFRC522_REG_FIFO_LEVEL     0x0A
+#define MFRC522_REG_WATER_LEVEL    0x0B
+#define MFRC522_REG_CONTROL        0x0C
+#define MFRC522_REG_BIT_FRAMING    0x0D
+#define MFRC522_REG_COLL           0x0E
+#define MFRC522_REG_MODE           0x11
+#define MFRC522_REG_TXMODE         0x12
+#define MFRC522_REG_RXMODE         0x13
+#define MFRC522_REG_TX_CONTROL     0x14
+#define MFRC522_REG_TX_ASK         0x15
+#define MFRC522_REG_CRC_RESULT_H   0x21
+#define MFRC522_REG_CRC_RESULT_L   0x22
+#define MFRC522_REG_MOD_WIDTH      0x24
+#define MFRC522_REG_RF_CFG         0x26
+#define MFRC522_REG_TMODE          0x2A
+#define MFRC522_REG_TPRESCALER     0x2B
+#define MFRC522_REG_TRELOADL       0x2C
+#define MFRC522_REG_TRELOADH       0x2D
+#define MFRC522_REG_VERSION        0x37
+
+
+// Global variables
+uint8_t uid[4]= {0};
+unsigned char uidLength;
+
+int y,x,i,a,b,row,col,ppl_status;
+unsigned status = 0;
+
+// Keymap for 4X4 Keypad
+const char keyMap[4][4] = {
+		{'1','2','3','A'},
+		{'4','5','6','B'},
+		{'7','8','9','C'},
+		{'*','0','#','D'}
+};
+
+// Function to scan the keypad
+char scanKeypad(void){
+	while (1) {  // Continuously scan until a key is detected
+	        for (row = 0; row < 4; row++) {
+	            // Set the current row to LOW (active)
+	            IOWR_ALTERA_AVALON_PIO_DATA(KEYPAD_ROW_BASE, ~(1 << row));
+
+	            // Read the column states
+	            alt_u32 colState = IORD_ALTERA_AVALON_PIO_DATA(KEYPAD_COLUMN_BASE);
+
+	            for (col = 0; col < 4; col++) {
+	                // Check if the current column is LOW (key pressed)
+	                if ((colState & (1 << col)) == 0) {
+	                    usleep(50000); // Debounce delay
+
+	                    // Wait for the key to be released
+	                    while ((IORD_ALTERA_AVALON_PIO_DATA(KEYPAD_COLUMN_BASE) & (1 << col)) == 0);
+
+	                    // Reset the rows to default (all HIGH)
+	                    IOWR_ALTERA_AVALON_PIO_DATA(KEYPAD_ROW_BASE, 0xF);
+
+	                    return keyMap[row][col];
+	                }
+	            }
+	        }
+	    }
+	return '\0';
+}
+
+// Function to send a single character over UART
+void uart_send_char(char c) {
+    while (!(IORD_ALTERA_AVALON_UART_STATUS(UART_BASE) & ALTERA_AVALON_UART_STATUS_TRDY_MSK));  // Wait until the transmitter is ready
+    IOWR_ALTERA_AVALON_UART_TXDATA(UART_BASE, c);  // Send the character
+}
+
+// Function to send a string over UART
+void uart_send_string(const char* str) {
+    while (*str) {
+        uart_send_char(*str);
+        str++;
+    }
+}
+
+void set_vga_colors(char foreground, char background) {
+    volatile char *vga_color_control = (volatile char *) VGA_COLOR_BASE;
+    *vga_color_control = (foreground << 4) | background;
+}
+
+void write_char_to_vga(int x, int y, char c) {
+    // Calculate the position in the character buffer
+	volatile char *vga_char_buf = (volatile char *) VGA_CHAR_BASE;
+	int index = (y * 128)+ x;
+	    // Ensure the index is within the buffer range
+	vga_char_buf[index] = c;
+}
+
+void clear_vga_fullscreen() {
+    volatile char *vga_char_buf = (volatile char *) VGA_CHAR_BASE;
+    for (y = 0; y < 60; y++) {
+        for (x = 0; x < 128; x++) {
+            vga_char_buf[y * 128 + x] = ' ';  // Fill with spaces
+        }
+    }
+}
+
+void clear_vga_screen() {
+    volatile char *vga_char_buf = (volatile char *) VGA_CHAR_BASE;
+    for (y = 15; y < 39; y++) {
+        for (x = 21; x < 60; x++) {
+            vga_char_buf[y * 128 + x] = ' ';  // Fill with spaces
+        }
+    }
+}
+
+void enable_frame() {
+	for (x = 20; x < 61; x++) {
+	    	write_char_to_vga(x, 13, 'X');
+	}
+
+	for (x = 20; x < 61; x++) {
+			write_char_to_vga(x, 40, 'X');
+	}
+
+	for (y = 14; y < 40; y++) {
+			write_char_to_vga(20, y, 'X');
+	}
+
+	for (y = 14; y < 40; y++) {
+			write_char_to_vga(60, y, 'X');
+	}
+    a = 15;
+    // Write simple text to the VGA screen
+    write_char_to_vga(31, a, 'S');
+    write_char_to_vga(32, a, 'M');
+    write_char_to_vga(33, a, 'A');
+    write_char_to_vga(34, a, 'R');
+    write_char_to_vga(35, a, 'T');
+
+    write_char_to_vga(37, a, 'L');
+    write_char_to_vga(38, a, 'I');
+    write_char_to_vga(39, a, 'B');
+    write_char_to_vga(40, a, 'R');
+    write_char_to_vga(41, a, 'A');
+    write_char_to_vga(42, a, 'R');
+    write_char_to_vga(43, a, 'Y');
+
+    write_char_to_vga(45, a, 'L');
+    write_char_to_vga(46, a, 'O');
+    write_char_to_vga(47, a, 'C');
+    write_char_to_vga(48, a, 'K');
+    write_char_to_vga(49, a, 'E');
+    write_char_to_vga(50, a, 'R');
+
+    a= 16;
+    write_char_to_vga(31, a, '-');
+    write_char_to_vga(32, a, '-');
+    write_char_to_vga(33, a, '-');
+    write_char_to_vga(34, a, '-');
+    write_char_to_vga(35, a, '-');
+    write_char_to_vga(36, a, '-');
+    write_char_to_vga(37, a, '-');
+    write_char_to_vga(38, a, '-');
+    write_char_to_vga(39, a, '-');
+    write_char_to_vga(40, a, '-');
+    write_char_to_vga(41, a, '-');
+    write_char_to_vga(42, a, '-');
+    write_char_to_vga(43, a, '-');
+    write_char_to_vga(44, a, '-');
+    write_char_to_vga(45, a, '-');
+    write_char_to_vga(46, a, '-');
+    write_char_to_vga(47, a, '-');
+    write_char_to_vga(48, a, '-');
+    write_char_to_vga(49, a, '-');
+    write_char_to_vga(50, a, '-');
+}
+
+void welcoming_screen() {
+    a = 20;
+    // Write simple text to the VGA screen
+    write_char_to_vga(24, a, 'W');
+    write_char_to_vga(25, a, 'E');
+    write_char_to_vga(26, a, 'L');
+    write_char_to_vga(27, a, 'C');
+    write_char_to_vga(28, a, 'O');
+    write_char_to_vga(29, a, 'M');
+    write_char_to_vga(30, a, 'E');
+
+    write_char_to_vga(32, a, 'T');
+    write_char_to_vga(33, a, 'O');
+
+    write_char_to_vga(35, a, 'M');
+    write_char_to_vga(36, a, 'X');
+
+    write_char_to_vga(38, a, 'S');
+    write_char_to_vga(39, a, 'M');
+    write_char_to_vga(40, a, 'A');
+    write_char_to_vga(41, a, 'R');
+    write_char_to_vga(42, a, 'T');
+
+    write_char_to_vga(44, a, 'L');
+    write_char_to_vga(45, a, 'I');
+    write_char_to_vga(46, a, 'B');
+    write_char_to_vga(47, a, 'R');
+    write_char_to_vga(48, a, 'A');
+    write_char_to_vga(49, a, 'R');
+    write_char_to_vga(50, a, 'Y');
+
+    write_char_to_vga(52, a, 'L');
+	write_char_to_vga(53, a, 'O');
+	write_char_to_vga(54, a, 'C');
+	write_char_to_vga(55, a, 'K');
+	write_char_to_vga(56, a, 'E');
+	write_char_to_vga(57, a, 'R');
+
+    a = 26;
+    write_char_to_vga(26, a, '-');
+    write_char_to_vga(27, a, '-');
+    write_char_to_vga(28, a, 'P');
+    write_char_to_vga(29, a, 'l');
+    write_char_to_vga(30, a, 'e');
+    write_char_to_vga(31, a, 'a');
+    write_char_to_vga(32, a, 's');
+    write_char_to_vga(33, a, 'e');
+
+    write_char_to_vga(35, a, 'S');
+    write_char_to_vga(36, a, 'c');
+    write_char_to_vga(37, a, 'a');
+    write_char_to_vga(38, a, 'n');
+
+    write_char_to_vga(40, a, 'Y');
+    write_char_to_vga(41, a, 'o');
+    write_char_to_vga(42, a, 'u');
+    write_char_to_vga(43, a, 'r');
+
+    write_char_to_vga(45, a, 'R');
+    write_char_to_vga(46, a, 'F');
+    write_char_to_vga(47, a, 'I');
+    write_char_to_vga(48, a, 'D');
+
+    write_char_to_vga(50, a, 'T');
+    write_char_to_vga(51, a, 'a');
+    write_char_to_vga(52, a, 'g');
+    write_char_to_vga(53, a, '-');
+    write_char_to_vga(54, a, '-');
+
+    a = 29;
+	write_char_to_vga(38, a, 'O');
+	write_char_to_vga(39, a, 'R');
+
+	a = 32;
+	write_char_to_vga(26, a, '-');
+	write_char_to_vga(27, a, '-');
+	write_char_to_vga(28, a, 'P');
+	write_char_to_vga(29, a, 'r');
+	write_char_to_vga(30, a, 'e');
+	write_char_to_vga(31, a, 's');
+	write_char_to_vga(32, a, 's');
+
+	write_char_to_vga(34, a, '[');
+	write_char_to_vga(35, a, '*');
+	write_char_to_vga(36, a, ']');
+
+	write_char_to_vga(38, a, 'P');
+	write_char_to_vga(39, a, 'a');
+	write_char_to_vga(40, a, 's');
+	write_char_to_vga(41, a, 's');
+	write_char_to_vga(42, a, 'w');
+	write_char_to_vga(43, a, 'o');
+	write_char_to_vga(44, a, 'r');
+	write_char_to_vga(45, a, 'd');
+
+	write_char_to_vga(47, a, 'E');
+	write_char_to_vga(48, a, 'n');
+	write_char_to_vga(49, a, 't');
+	write_char_to_vga(50, a, 'r');
+	write_char_to_vga(51, a, 'y');
+    write_char_to_vga(52, a, '-');
+    write_char_to_vga(53, a, '-');
+
+}
+
+void rfid_id_screen(char id[]) {
+    a = 23;
+    // Write simple text to the VGA screen
+    write_char_to_vga(24, a, 'W');
+    write_char_to_vga(25, a, 'E');
+    write_char_to_vga(26, a, 'L');
+    write_char_to_vga(27, a, 'C');
+    write_char_to_vga(28, a, 'O');
+    write_char_to_vga(29, a, 'M');
+    write_char_to_vga(30, a, 'E');
+
+    write_char_to_vga(32, a, 'T');
+    write_char_to_vga(33, a, 'O');
+
+    write_char_to_vga(35, a, 'M');
+    write_char_to_vga(36, a, 'X');
+
+    write_char_to_vga(38, a, 'S');
+    write_char_to_vga(39, a, 'M');
+    write_char_to_vga(40, a, 'A');
+    write_char_to_vga(41, a, 'R');
+    write_char_to_vga(42, a, 'T');
+
+    write_char_to_vga(44, a, 'L');
+    write_char_to_vga(45, a, 'I');
+    write_char_to_vga(46, a, 'B');
+    write_char_to_vga(47, a, 'R');
+    write_char_to_vga(48, a, 'A');
+    write_char_to_vga(49, a, 'R');
+    write_char_to_vga(50, a, 'Y');
+
+    write_char_to_vga(52, a, 'L');
+	write_char_to_vga(53, a, 'O');
+	write_char_to_vga(54, a, 'C');
+	write_char_to_vga(55, a, 'K');
+	write_char_to_vga(56, a, 'E');
+	write_char_to_vga(57, a, 'R');
+
+    a = 29;
+    write_char_to_vga(28, a, '-');
+    write_char_to_vga(29, a, '-');
+    write_char_to_vga(31, a, 'R');
+    write_char_to_vga(32, a, 'F');
+    write_char_to_vga(33, a, 'I');
+    write_char_to_vga(34, a, 'D');
+
+    write_char_to_vga(36, a, '=');
+
+    write_char_to_vga(38, a, id[0]);
+    write_char_to_vga(39, a, id[1]);
+    write_char_to_vga(41, a, id[3]);
+    write_char_to_vga(42, a, id[4]);
+    write_char_to_vga(43, a, id[5]);
+    write_char_to_vga(44, a, id[6]);
+    write_char_to_vga(45, a, id[7]);
+    write_char_to_vga(46, a, id[8]);
+    write_char_to_vga(47, a, id[9]);
+    write_char_to_vga(48, a, id[10]);
+    write_char_to_vga(50, a, '-');
+    write_char_to_vga(51, a, '-');
+
+}
+
+void rfid_not_match_screen(){
+	clear_vga_screen();
+	a = 26;
+	write_char_to_vga(33, a, 'R');
+	write_char_to_vga(34, a, 'F');
+	write_char_to_vga(35, a, 'I');
+	write_char_to_vga(36, a, 'D');
+
+	write_char_to_vga(38, a, 'N');
+	write_char_to_vga(39, a, 'o');
+	write_char_to_vga(40, a, 't');
+
+	write_char_to_vga(42, a, 'M');
+	write_char_to_vga(43, a, 'a');
+	write_char_to_vga(44, a, 't');
+	write_char_to_vga(45, a, 'c');
+	write_char_to_vga(46, a, 'h');
+}
+
+void keyin_pass_screen(int x){
+	clear_vga_screen();
+	a = 25;
+	write_char_to_vga(25, a, '-');
+	write_char_to_vga(26, a, '-');
+	write_char_to_vga(27, a, 'P');
+	write_char_to_vga(28, a, 'l');
+	write_char_to_vga(29, a, 'e');
+	write_char_to_vga(30, a, 'a');
+	write_char_to_vga(31, a, 's');
+	write_char_to_vga(32, a, 'e');
+
+	write_char_to_vga(34, a, 'k');
+	write_char_to_vga(35, a, 'e');
+	write_char_to_vga(36, a, 'y');
+
+	write_char_to_vga(38, a, 'i');
+	write_char_to_vga(39, a, 'n');
+
+	write_char_to_vga(41, a, 'y');
+	write_char_to_vga(42, a, 'o');
+	write_char_to_vga(43, a, 'u');
+	write_char_to_vga(44, a, 'r');
+
+	write_char_to_vga(46, a, 'p');
+	write_char_to_vga(47, a, 'a');
+	write_char_to_vga(48, a, 's');
+	write_char_to_vga(49, a, 's');
+	write_char_to_vga(50, a, 'w');
+	write_char_to_vga(51, a, 'o');
+	write_char_to_vga(52, a, 'r');
+	write_char_to_vga(53, a, 'd');
+	write_char_to_vga(54, a, '-');
+	write_char_to_vga(55, a, '-');
+
+	switch (x){
+		case 1:
+			write_char_to_vga(37, 28, '*');
+			break;
+
+		case 2:
+			write_char_to_vga(37, 28, '*');
+			write_char_to_vga(39, 28, '*');
+			break;
+
+		case 3:
+			write_char_to_vga(37, 28, '*');
+			write_char_to_vga(39, 28, '*');
+			write_char_to_vga(41, 28, '*');
+			break;
+
+		case 4:
+			write_char_to_vga(37, 28, '*');
+			write_char_to_vga(39, 28, '*');
+			write_char_to_vga(41, 28, '*');
+			write_char_to_vga(43, 28, '*');
+			break;
+	}
+}
+
+void open_pass_screen() {
+	a = 21;
+	write_char_to_vga(25, a, '-');
+	write_char_to_vga(26, a, '-');
+	write_char_to_vga(27, a, 'P');
+	write_char_to_vga(28, a, 'l');
+	write_char_to_vga(29, a, 'e');
+	write_char_to_vga(30, a, 'a');
+	write_char_to_vga(31, a, 's');
+	write_char_to_vga(32, a, 'e');
+
+	write_char_to_vga(34, a, 'c');
+	write_char_to_vga(35, a, 'h');
+	write_char_to_vga(36, a, 'o');
+	write_char_to_vga(37, a, 'o');
+	write_char_to_vga(38, a, 's');
+	write_char_to_vga(39, a, 'e');
+
+	write_char_to_vga(41, a, 'y');
+	write_char_to_vga(42, a, 'o');
+	write_char_to_vga(43, a, 'u');
+	write_char_to_vga(44, a, 'r');
+
+	write_char_to_vga(46, a, 'o');
+	write_char_to_vga(47, a, 'p');
+	write_char_to_vga(48, a, 'e');
+	write_char_to_vga(49, a, 'r');
+	write_char_to_vga(50, a, 'a');
+	write_char_to_vga(51, a, 't');
+	write_char_to_vga(52, a, 'i');
+	write_char_to_vga(53, a, 'o');
+	write_char_to_vga(54, a, 'n');
+	write_char_to_vga(55, a, '-');
+	write_char_to_vga(56, a, '-');
+
+	a = 27;
+	write_char_to_vga(25, a, '[');
+	write_char_to_vga(26, a, 'A');
+	write_char_to_vga(27, a, ']');
+
+	write_char_to_vga(29, a, 'O');
+	write_char_to_vga(30, a, 'p');
+	write_char_to_vga(31, a, 'e');
+	write_char_to_vga(32, a, 'n');
+
+	write_char_to_vga(34, a, 'L');
+	write_char_to_vga(35, a, 'o');
+	write_char_to_vga(36, a, 'c');
+	write_char_to_vga(37, a, 'k');
+	write_char_to_vga(38, a, 'e');
+	write_char_to_vga(39, a, 'r');
+
+	a = 30;
+	write_char_to_vga(25, a, '[');
+	write_char_to_vga(26, a, 'B');
+	write_char_to_vga(27, a, ']');
+
+	write_char_to_vga(29, a, 'S');
+	write_char_to_vga(30, a, 'e');
+	write_char_to_vga(31, a, 't');
+
+	write_char_to_vga(33, a, '/');
+
+	write_char_to_vga(35, a, 'R');
+	write_char_to_vga(36, a, 'e');
+	write_char_to_vga(37, a, 's');
+	write_char_to_vga(38, a, 'e');
+	write_char_to_vga(39, a, 't');
+
+	write_char_to_vga(41, a, 'P');
+	write_char_to_vga(42, a, 'a');
+	write_char_to_vga(43, a, 's');
+	write_char_to_vga(44, a, 's');
+	write_char_to_vga(45, a, 'w');
+	write_char_to_vga(46, a, 'o');
+	write_char_to_vga(47, a, 'r');
+	write_char_to_vga(48, a, 'd');
+
+	a = 33;
+	write_char_to_vga(25, a, '[');
+	write_char_to_vga(26, a, 'C');
+	write_char_to_vga(27, a, ']');
+
+	write_char_to_vga(29, a, 'E');
+	write_char_to_vga(30, a, 'x');
+	write_char_to_vga(31, a, 'i');
+	write_char_to_vga(32, a, 't');
+
+	write_char_to_vga(34, a, 'T');
+	write_char_to_vga(35, a, 'o');
+
+	write_char_to_vga(37, a, 'M');
+	write_char_to_vga(38, a, 'a');
+	write_char_to_vga(39, a, 'i');
+	write_char_to_vga(40, a, 'n');
+
+	write_char_to_vga(42, a, 'M');
+	write_char_to_vga(43, a, 'e');
+	write_char_to_vga(44, a, 'n');
+	write_char_to_vga(45, a, 'u');
+}
+
+void locker_open_screen(){
+	a = 21;
+	write_char_to_vga(34, a, '-');
+	write_char_to_vga(35, a, '-');
+	write_char_to_vga(36, a, 'T');
+	write_char_to_vga(37, a, 'h');
+	write_char_to_vga(38, a, 'a');
+	write_char_to_vga(39, a, 'n');
+	write_char_to_vga(40, a, 'k');
+
+	write_char_to_vga(42, a, 'Y');
+	write_char_to_vga(43, a, 'o');
+	write_char_to_vga(44, a, 'u');
+	write_char_to_vga(45, a, '-');
+	write_char_to_vga(46, a, '-');
+
+	a = 27;
+	write_char_to_vga(33, a, 'L');
+	write_char_to_vga(34, a, 'o');
+	write_char_to_vga(35, a, 'c');
+	write_char_to_vga(36, a, 'k');
+	write_char_to_vga(37, a, 'e');
+	write_char_to_vga(38, a, 'r');
+
+	write_char_to_vga(40, a, 'o');
+	write_char_to_vga(41, a, 'p');
+	write_char_to_vga(42, a, 'e');
+	write_char_to_vga(43, a, 'n');
+	write_char_to_vga(44, a, 'e');
+	write_char_to_vga(45, a, 'd');
+	write_char_to_vga(46, a, '!');
+	write_char_to_vga(47, a, '!');
+	write_char_to_vga(48, a, '!');
+}
+
+void set_reset_screen(){
+	a = 21;
+	write_char_to_vga(25, a, '-');
+	write_char_to_vga(26, a, '-');
+	write_char_to_vga(27, a, 'P');
+	write_char_to_vga(28, a, 'l');
+	write_char_to_vga(29, a, 'e');
+	write_char_to_vga(30, a, 'a');
+	write_char_to_vga(31, a, 's');
+	write_char_to_vga(32, a, 'e');
+
+	write_char_to_vga(34, a, 'c');
+	write_char_to_vga(35, a, 'h');
+	write_char_to_vga(36, a, 'o');
+	write_char_to_vga(37, a, 'o');
+	write_char_to_vga(38, a, 's');
+	write_char_to_vga(39, a, 'e');
+
+	write_char_to_vga(41, a, 'y');
+	write_char_to_vga(42, a, 'o');
+	write_char_to_vga(43, a, 'u');
+	write_char_to_vga(44, a, 'r');
+
+	write_char_to_vga(46, a, 'o');
+	write_char_to_vga(47, a, 'p');
+	write_char_to_vga(48, a, 'e');
+	write_char_to_vga(49, a, 'r');
+	write_char_to_vga(50, a, 'a');
+	write_char_to_vga(51, a, 't');
+	write_char_to_vga(52, a, 'i');
+	write_char_to_vga(53, a, 'o');
+	write_char_to_vga(54, a, 'n');
+	write_char_to_vga(55, a, '-');
+	write_char_to_vga(56, a, '-');
+
+	a = 27;
+	write_char_to_vga(25, a, '[');
+	write_char_to_vga(26, a, 'A');
+	write_char_to_vga(27, a, ']');
+
+	write_char_to_vga(29, a, 'S');
+	write_char_to_vga(30, a, 'e');
+	write_char_to_vga(31, a, 't');
+
+	write_char_to_vga(33, a, 'P');
+	write_char_to_vga(34, a, 'a');
+	write_char_to_vga(35, a, 's');
+	write_char_to_vga(36, a, 's');
+	write_char_to_vga(37, a, 'w');
+	write_char_to_vga(38, a, 'o');
+	write_char_to_vga(39, a, 'r');
+	write_char_to_vga(40, a, 'd');
+
+	a = 30;
+	write_char_to_vga(25, a, '[');
+	write_char_to_vga(26, a, 'B');
+	write_char_to_vga(27, a, ']');
+
+	write_char_to_vga(29, a, 'R');
+	write_char_to_vga(30, a, 'e');
+	write_char_to_vga(31, a, 's');
+	write_char_to_vga(32, a, 'e');
+	write_char_to_vga(33, a, 't');
+
+	write_char_to_vga(35, a, 'P');
+	write_char_to_vga(36, a, 'a');
+	write_char_to_vga(37, a, 's');
+	write_char_to_vga(38, a, 's');
+	write_char_to_vga(39, a, 'w');
+	write_char_to_vga(40, a, 'o');
+	write_char_to_vga(41, a, 'r');
+	write_char_to_vga(42, a, 'w');
+	write_char_to_vga(43, a, 'd');
+
+	a = 33;
+	write_char_to_vga(25, a, '[');
+	write_char_to_vga(26, a, 'C');
+	write_char_to_vga(27, a, ']');
+
+	write_char_to_vga(29, a, 'E');
+	write_char_to_vga(30, a, 'x');
+	write_char_to_vga(31, a, 'i');
+	write_char_to_vga(32, a, 't');
+
+	write_char_to_vga(34, a, 'T');
+	write_char_to_vga(35, a, 'o');
+
+	write_char_to_vga(37, a, 'M');
+	write_char_to_vga(38, a, 'a');
+	write_char_to_vga(39, a, 'i');
+	write_char_to_vga(40, a, 'n');
+
+	write_char_to_vga(42, a, 'M');
+	write_char_to_vga(43, a, 'e');
+	write_char_to_vga(44, a, 'n');
+	write_char_to_vga(45, a, 'u');
+}
+
+void pass_set_screen(){
+	a = 21;
+	write_char_to_vga(34, a, '-');
+	write_char_to_vga(35, a, '-');
+	write_char_to_vga(36, a, 'T');
+	write_char_to_vga(37, a, 'h');
+	write_char_to_vga(38, a, 'a');
+	write_char_to_vga(39, a, 'n');
+	write_char_to_vga(40, a, 'k');
+
+	write_char_to_vga(42, a, 'Y');
+	write_char_to_vga(43, a, 'o');
+	write_char_to_vga(44, a, 'u');
+	write_char_to_vga(45, a, '-');
+	write_char_to_vga(46, a, '-');
+
+	a = 27;
+	write_char_to_vga(27, a, 'P');
+	write_char_to_vga(28, a, 'a');
+	write_char_to_vga(29, a, 's');
+	write_char_to_vga(30, a, 's');
+	write_char_to_vga(31, a, 'w');
+	write_char_to_vga(32, a, 'o');
+	write_char_to_vga(33, a, 'r');
+	write_char_to_vga(34, a, 'd');
+
+	write_char_to_vga(36, a, 's');
+	write_char_to_vga(37, a, 'e');
+	write_char_to_vga(38, a, 't');
+
+	write_char_to_vga(40, a, 's');
+	write_char_to_vga(41, a, 'u');
+	write_char_to_vga(42, a, 'c');
+	write_char_to_vga(43, a, 'c');
+	write_char_to_vga(44, a, 'e');
+	write_char_to_vga(45, a, 's');
+	write_char_to_vga(46, a, 's');
+	write_char_to_vga(47, a, 'f');
+	write_char_to_vga(48, a, 'u');
+	write_char_to_vga(49, a, 'l');
+	write_char_to_vga(50, a, 'l');
+	write_char_to_vga(51, a, 'y');
+	write_char_to_vga(52, a, '!');
+	write_char_to_vga(53, a, '!');
+	write_char_to_vga(54, a, '!');
+}
+
+void oldpass_screen(int x){
+	a = 25;
+	write_char_to_vga(25, a, '-');
+	write_char_to_vga(26, a, '-');
+	write_char_to_vga(27, a, 'P');
+	write_char_to_vga(28, a, 'l');
+	write_char_to_vga(29, a, 'e');
+	write_char_to_vga(30, a, 'a');
+	write_char_to_vga(31, a, 's');
+	write_char_to_vga(32, a, 'e');
+
+	write_char_to_vga(34, a, 'c');
+	write_char_to_vga(35, a, 'o');
+	write_char_to_vga(36, a, 'n');
+	write_char_to_vga(37, a, 'f');
+	write_char_to_vga(38, a, 'i');
+	write_char_to_vga(39, a, 'r');
+	write_char_to_vga(40, a, 'm');
+
+	write_char_to_vga(42, a, 'o');
+	write_char_to_vga(43, a, 'l');
+	write_char_to_vga(44, a, 'd');
+
+	write_char_to_vga(46, a, 'p');
+	write_char_to_vga(47, a, 'a');
+	write_char_to_vga(48, a, 's');
+	write_char_to_vga(49, a, 's');
+	write_char_to_vga(50, a, 'w');
+	write_char_to_vga(51, a, 'o');
+	write_char_to_vga(52, a, 'r');
+	write_char_to_vga(53, a, 'd');
+	write_char_to_vga(54, a, '-');
+	write_char_to_vga(55, a, '-');
+
+	switch (x){
+		case 1:
+			write_char_to_vga(36, 28, '*');
+			break;
+
+		case 2:
+			write_char_to_vga(36, 28, '*');
+			write_char_to_vga(38, 28, '*');
+			break;
+
+		case 3:
+			write_char_to_vga(36, 28, '*');
+			write_char_to_vga(38, 28, '*');
+			write_char_to_vga(40, 28, '*');
+			break;
+
+		case 4:
+			write_char_to_vga(36, 28, '*');
+			write_char_to_vga(38, 28, '*');
+			write_char_to_vga(40, 28, '*');
+			write_char_to_vga(42, 28, '*');
+			break;
+	}
+}
+
+void keyin_newpass_screen(int x){
+	a = 21;
+	write_char_to_vga(26, a, '-');
+	write_char_to_vga(27, a, '-');
+	write_char_to_vga(28, a, 'O');
+	write_char_to_vga(29, a, 'l');
+	write_char_to_vga(30, a, 'd');
+
+	write_char_to_vga(32, a, 'P');
+	write_char_to_vga(33, a, 'a');
+	write_char_to_vga(34, a, 's');
+	write_char_to_vga(35, a, 's');
+	write_char_to_vga(36, a, 'w');
+	write_char_to_vga(37, a, 'o');
+	write_char_to_vga(38, a, 'r');
+	write_char_to_vga(39, a, 'd');
+
+	write_char_to_vga(41, a, 'c');
+	write_char_to_vga(42, a, 'o');
+	write_char_to_vga(43, a, 'n');
+	write_char_to_vga(44, a, 'f');
+	write_char_to_vga(45, a, 'i');
+	write_char_to_vga(46, a, 'r');
+	write_char_to_vga(47, a, 'm');
+	write_char_to_vga(48, a, 'e');
+	write_char_to_vga(49, a, 'd');
+	write_char_to_vga(50, a, '!');
+	write_char_to_vga(51, a, '!');
+	write_char_to_vga(52, a, '!');
+	write_char_to_vga(53, a, '-');
+	write_char_to_vga(54, a, '-');
+
+	a = 27;
+	write_char_to_vga(28, a, 'P');
+	write_char_to_vga(29, a, 'l');
+	write_char_to_vga(30, a, 'e');
+	write_char_to_vga(31, a, 'a');
+	write_char_to_vga(32, a, 's');
+	write_char_to_vga(33, a, 'e');
+
+	write_char_to_vga(35, a, 'k');
+	write_char_to_vga(36, a, 'e');
+	write_char_to_vga(37, a, 'y');
+
+	write_char_to_vga(39, a, 'i');
+	write_char_to_vga(40, a, 'n');
+
+	write_char_to_vga(42, a, 'n');
+	write_char_to_vga(43, a, 'e');
+	write_char_to_vga(44, a, 'w');
+
+	write_char_to_vga(46, a, 'p');
+	write_char_to_vga(47, a, 'a');
+	write_char_to_vga(48, a, 's');
+	write_char_to_vga(49, a, 's');
+	write_char_to_vga(50, a, 'w');
+	write_char_to_vga(51, a, 'o');
+	write_char_to_vga(52, a, 'r');
+	write_char_to_vga(53, a, 'd');
+
+
+	a=30;
+	switch (x){
+		case 1:
+			write_char_to_vga(38, a, '*');
+			break;
+
+		case 2:
+			write_char_to_vga(38, a, '*');
+			write_char_to_vga(40, a, '*');
+			break;
+
+		case 3:
+			write_char_to_vga(38, a, '*');
+			write_char_to_vga(40, a, '*');
+			write_char_to_vga(42, a, '*');
+			break;
+
+		case 4:
+			write_char_to_vga(38, a, '*');
+			write_char_to_vga(40, a, '*');
+			write_char_to_vga(42, a, '*');
+			write_char_to_vga(44, a, '*');
+			break;
+	}
+}
+
+void pass_fail_screen(){
+	a = 21;
+		write_char_to_vga(34, a, '-');
+		write_char_to_vga(35, a, '-');
+		write_char_to_vga(36, a, 'T');
+		write_char_to_vga(37, a, 'h');
+		write_char_to_vga(38, a, 'a');
+		write_char_to_vga(39, a, 'n');
+		write_char_to_vga(40, a, 'k');
+
+		write_char_to_vga(42, a, 'Y');
+		write_char_to_vga(43, a, 'o');
+		write_char_to_vga(44, a, 'u');
+		write_char_to_vga(45, a, '-');
+		write_char_to_vga(46, a, '-');
+
+		a = 32;
+		write_char_to_vga(30, a, 'P');
+		write_char_to_vga(31, a, 'a');
+		write_char_to_vga(32, a, 's');
+		write_char_to_vga(33, a, 's');
+		write_char_to_vga(34, a, 'w');
+		write_char_to_vga(35, a, 'o');
+		write_char_to_vga(36, a, 'r');
+		write_char_to_vga(37, a, 'd');
+
+		write_char_to_vga(39, a, 'n');
+		write_char_to_vga(40, a, 'o');
+		write_char_to_vga(41, a, 't');
+
+		write_char_to_vga(43, a, 'c');
+		write_char_to_vga(44, a, 'o');
+		write_char_to_vga(45, a, 'r');
+		write_char_to_vga(46, a, 'r');
+		write_char_to_vga(47, a, 'e');
+		write_char_to_vga(48, a, 'c');
+		write_char_to_vga(49, a, 't');
+
+		a = 34;
+		write_char_to_vga(30, a, 'P');
+		write_char_to_vga(31, a, 'l');
+		write_char_to_vga(32, a, 'e');
+		write_char_to_vga(33, a, 'a');
+		write_char_to_vga(34, a, 's');
+		write_char_to_vga(35, a, 'e');
+
+		write_char_to_vga(37, a, 't');
+		write_char_to_vga(38, a, 'r');
+		write_char_to_vga(39, a, 'y');
+
+		write_char_to_vga(41, a, 'a');
+		write_char_to_vga(42, a, 'g');
+		write_char_to_vga(43, a, 'a');
+		write_char_to_vga(44, a, 'i');
+		write_char_to_vga(45, a, 'n');
+		write_char_to_vga(46, a, '!');
+		write_char_to_vga(47, a, '!');
+		write_char_to_vga(48, a, '!');
+}
+
+void key_irq() {
+    alt_printf("Interrupt Triggered!\n");
+    IOWR_ALTERA_AVALON_PIO_DATA(BUZZER_BASE, 0xFF);
+    IOWR_ALTERA_AVALON_PIO_EDGE_CAP(BUTTON_INT_BASE, 0x0); // Clear interrupt flag
+    if (status){
+		 IOWR_ALTERA_AVALON_PIO_DATA(BUZZER_BASE, 0x00);
+		 status = 0;
+    }
+    else
+    	status++;
+}
+
+void key_irq_init(){
+	IOWR_ALTERA_AVALON_PIO_IRQ_MASK(BUTTON_INT_BASE, 0x1);
+	alt_ic_isr_register(BUTTON_INT_IRQ_INTERRUPT_CONTROLLER_ID, BUTTON_INT_IRQ, key_irq, 0, 0);
+}
+
+void inputPassword(char *password, int x){
+	int digitCount = 0;      // Counter for entered digits
+
+	while (digitCount < 4) {
+		char key = scanKeypad();  // Get pressed key
+		if (key >= '0' && key <= '9') {  // Accept only numeric keys
+			password[digitCount] = key;  // Save key to password array
+			alt_printf("*");  // Print '*' for feedback (to hide actual input)
+			clear_vga_screen();
+			digitCount++;
+			switch(x){
+				case 1:
+					keyin_pass_screen(digitCount);
+					break;
+
+				case 2:
+					oldpass_screen(digitCount);
+					break;
+
+				case 3:
+					keyin_newpass_screen(digitCount);
+					break;
+			}
+		} else {
+			alt_printf("\nInvalid input. Please enter numeric digits only.\n");
+		}
+		usleep(500000);
+	}
+}
+
+bool comparePasswords(const char *password1, const char *password2) {
+    for (i = 0; i < 4; i++) {
+        if (password1[i] != password2[i]) {
+            return false;  // Mismatch found
+        }
+    }
+    if (password1[0] == '0')
+    	return false;
+
+
+    return true;  // All characters matched
+}
+
+bool compareRFID(const uint8_t *rfid) {
+	uint8_t RFID[4] = {0xAC, 0xC0, 0x17, 0x6D};
+    for (i = 0; i < 4; i++) {
+        if (rfid[i] != RFID[i]) {
+            return false;  // Mismatch found
+        }
+    }
+    return true;  // All characters matched
+}
+
+unsigned char readRegister(unsigned char reg) {
+    unsigned char addr = ((reg << 1) & 0x7E) | 0x80;  // Address byte with read bit
+    unsigned char result;
+
+    IOWR_ALTERA_AVALON_PIO_DATA(SPI_CS_BASE, 0);
+    usleep(10);
+
+    // Single command for address
+	alt_avalon_spi_command(SPI_MASTER_BASE, 0, 1, &addr, 0, NULL, 0);
+	// Separate command for reading
+	alt_avalon_spi_command(SPI_MASTER_BASE, 0, 0, NULL, 1, &result, 0);
+
+    usleep(10);
+    IOWR_ALTERA_AVALON_PIO_DATA(SPI_CS_BASE, 1);
+    usleep(10);
+
+    return result;
+}
+
+void writeRegister(unsigned char reg, unsigned char value) {
+    // Add delay after CS going low
+    IOWR_ALTERA_AVALON_PIO_DATA(SPI_CS_BASE, 0);
+    usleep(10);  // Add small delay
+
+    // Combine address and value into single transaction if possible
+    unsigned char buffer[2] = {(reg << 1) & 0x7E, value};
+    alt_avalon_spi_command(SPI_MASTER_BASE, 0, 2, buffer, 0, NULL, 0);
+
+    usleep(10);  // Add small delay
+    IOWR_ALTERA_AVALON_PIO_DATA(SPI_CS_BASE, 1);
+    usleep(10);  // Add small delay
+}
+
+// Simplified initialization focusing on essential settings
+void PCD_Init() {
+    // Soft reset
+    writeRegister(MFRC522_REG_COMMAND, PCD_RESETPHASE);
+    usleep(50000);
+
+    // Minimum required configuration
+    writeRegister(MFRC522_REG_TXMODE, 0x00);    // Transmit data according to protocol
+    writeRegister(MFRC522_REG_RXMODE, 0x00);    // Receive data according to protocol
+    writeRegister(MFRC522_REG_MOD_WIDTH, 0x26);  // Modulation width setting
+    writeRegister(MFRC522_REG_TX_ASK, 0x40);     // Force 100% ASK modulation
+    writeRegister(MFRC522_REG_MODE, 0x3D);       // CRC Initial value 0x6363
+
+    // Enable antenna
+    writeRegister(MFRC522_REG_TX_CONTROL, 0x83);
+}
+
+// Simplified card detection
+int PICC_IsNewCardPresent() {
+    // Clear registers
+    writeRegister(MFRC522_REG_COMMAND, PCD_IDLE);
+    writeRegister(MFRC522_REG_COMIRQ, 0x7F);
+    writeRegister(MFRC522_REG_FIFO_LEVEL, 0x80);
+
+    // Configure for REQA
+    writeRegister(MFRC522_REG_BIT_FRAMING, 0x07);  // 7 bits
+
+    // Send REQA
+    unsigned char command = PICC_REQIDL;
+    unsigned char irqEn = 0x77;
+    unsigned char waitIRq = 0x30;
+
+    writeRegister(MFRC522_REG_COMIEN, irqEn);
+    writeRegister(MFRC522_REG_DIVIEN, 0x00);
+    writeRegister(MFRC522_REG_COMIRQ, 0x7F);
+    writeRegister(MFRC522_REG_DIVIRQ, 0x7F);
+
+    // Write data to FIFO
+    writeRegister(MFRC522_REG_FIFO_DATA, command);
+
+    // Start transmission
+    writeRegister(MFRC522_REG_COMMAND, PCD_TRANSCEIVE);
+    writeRegister(MFRC522_REG_BIT_FRAMING, 0x87);  // Start transmission
+
+    // Wait for completion
+    unsigned long timeout = 2500;
+    unsigned char irqReg;
+    do {
+        irqReg = readRegister(MFRC522_REG_COMIRQ);
+        timeout--;
+        usleep(1);
+    } while ((timeout != 0) && !(irqReg & waitIRq));
+
+    // Stop transmission
+    writeRegister(MFRC522_REG_BIT_FRAMING, 0x00);
+
+    if (timeout != 0) {
+        unsigned char fifoLevel = readRegister(MFRC522_REG_FIFO_LEVEL);
+        if (fifoLevel == 2) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+// Function to clear register bits
+void PCD_ClearRegisterBitMask(unsigned char reg, unsigned char mask) {
+    unsigned char tmp = readRegister(reg);
+    writeRegister(reg, tmp & (~mask));
+}
+
+// Function to set register bits
+void PCD_SetRegisterBitMask(unsigned char reg, unsigned char mask) {
+    unsigned char tmp = readRegister(reg);
+    writeRegister(reg, tmp | mask);
+}
+
+// Modify PCD_CommunicateWithPICC function for better timing
+unsigned char PCD_CommunicateWithPICC(unsigned char command, unsigned char waitIRq,
+                                     unsigned char *sendData, unsigned char sendLen,
+                                     unsigned char *backData, unsigned char *backLen,
+                                     unsigned char validBits) {
+    unsigned char irqEn = 0x00;
+    unsigned char waitFor = 0x00;
+
+    if (command == PCD_TRANSCEIVE) {
+        irqEn = 0x77;    // Enable TxIRq, RxIRq, IdleIRq, HiAlertIRq, LoAlertIRq, ErrIRq, TimerIRq
+        waitFor = 0x30;  // Wait for RxIRq and IdleIRq
+    }
+
+    // Configure interrupt registers
+    writeRegister(MFRC522_REG_COMIEN, irqEn);
+    writeRegister(MFRC522_REG_DIVIEN, 0x00);
+
+    // Clear all interrupt flags
+    writeRegister(MFRC522_REG_COMIRQ, 0x7F);
+    writeRegister(MFRC522_REG_DIVIRQ, 0x7F);
+
+    // Prepare FIFO
+    writeRegister(MFRC522_REG_COMMAND, PCD_IDLE);
+    writeRegister(MFRC522_REG_FIFO_LEVEL, 0x80);  // Clear FIFO
+
+    // Write data to FIFO
+    for (i = 0; i < sendLen; i++) {
+        writeRegister(MFRC522_REG_FIFO_DATA, sendData[i]);
+    }
+
+    // Execute command
+    writeRegister(MFRC522_REG_COMMAND, command);
+
+    if (command == PCD_TRANSCEIVE) {
+        PCD_SetRegisterBitMask(MFRC522_REG_BIT_FRAMING, 0x80);  // Start transmission
+    }
+
+    // Wait for completion or timeout
+    unsigned long timeout = 5000;  // Increased timeout value
+    unsigned char irqReg;
+    do {
+        irqReg = readRegister(MFRC522_REG_COMIRQ);
+        timeout--;
+        usleep(1);  // Small delay between checks
+    } while ((timeout != 0) && !(irqReg & waitFor) && !(irqReg & 0x01));  // Wait for either desired IRQ or error
+
+    // Stop transmission
+    PCD_ClearRegisterBitMask(MFRC522_REG_BIT_FRAMING, 0x80);
+
+    alt_printf("IRQ Register: 0x%02X\n", irqReg);
+
+    if (timeout == 0) {
+        alt_printf("Communication timeout\n");
+        return 0x02;  // Timeout
+    }
+
+    // Check for errors
+    unsigned char errorReg = readRegister(MFRC522_REG_ERROR);
+    if (errorReg & 0x13) {
+        alt_printf("Communication error: 0x%02X\n", errorReg);
+        return 0x03;  // Error
+    }
+
+    // Read received data
+    if (backData && backLen) {
+        unsigned char fifoLevel = readRegister(MFRC522_REG_FIFO_LEVEL);
+        alt_printf("FIFO Level: %d\n", fifoLevel);
+
+        if (fifoLevel > *backLen) {
+            alt_printf("FIFO overflow\n");
+            return 0x03;
+        }
+
+        *backLen = fifoLevel;
+        for (i = 0; i < fifoLevel; i++) {
+            backData[i] = readRegister(MFRC522_REG_FIFO_DATA);
+        }
+    }
+
+    return 0x00;  // Success
+}
+
+// Simplified UID reading
+int PICC_ReadCardSerial() {
+    unsigned char command[2] = {PICC_ANTICOLL, 0x20};
+    unsigned char result[5];  // 4 bytes UID + 1 byte BCC
+
+    writeRegister(MFRC522_REG_BIT_FRAMING, 0x00);  // Clear bit frame adjustments
+    writeRegister(MFRC522_REG_COLL, 0x00);         // All bits are valid
+
+    // Send anticollision command
+    writeRegister(MFRC522_REG_COMMAND, PCD_IDLE);
+    writeRegister(MFRC522_REG_COMIRQ, 0x7F);
+    writeRegister(MFRC522_REG_FIFO_LEVEL, 0x80);
+
+    // Write command to FIFO
+    writeRegister(MFRC522_REG_FIFO_DATA, command[0]);
+    writeRegister(MFRC522_REG_FIFO_DATA, command[1]);
+
+    // Start transmission
+    writeRegister(MFRC522_REG_COMMAND, PCD_TRANSCEIVE);
+    writeRegister(MFRC522_REG_BIT_FRAMING, 0x80);  // Start transmission
+
+    // Wait for completion
+    unsigned long timeout = 10000;
+    unsigned char irqReg;
+    do {
+        irqReg = readRegister(MFRC522_REG_COMIRQ);
+        timeout--;
+        usleep(1);
+    } while ((timeout != 0) && !(irqReg & 0x30));
+
+    if (timeout != 0) {
+        unsigned char fifoLevel = readRegister(MFRC522_REG_FIFO_LEVEL);
+        if (fifoLevel == 5) {
+            for (i = 0; i < 5; i++) {
+                result[i] = readRegister(MFRC522_REG_FIFO_DATA);
+            }
+
+            // Calculate BCC
+            unsigned char bcc = result[0] ^ result[1] ^ result[2] ^ result[3];
+
+            if (bcc == result[4]) {
+                uidLength = 4;
+                for (i = 0; i < 4; i++) {
+                    uid[i] = result[i];
+                }
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+void store_hex_id(uint8_t *hex_data, size_t length, char *output_buffer) {
+    size_t i;
+    size_t buffer_index = 0;
+
+    for (i = 0; i < length; i++) {
+        // Convert each nibble (4 bits) to hexadecimal characters
+        uint8_t high_nibble = (hex_data[i] >> 4) & 0xF; // Extract high nibble
+        uint8_t low_nibble = hex_data[i] & 0xF;         // Extract low nibble
+
+        // Store high nibble as a hexadecimal character
+        output_buffer[buffer_index++] = high_nibble > 9 ? ('A' + high_nibble - 10) : ('0' + high_nibble);
+
+        // Store low nibble as a hexadecimal character
+        output_buffer[buffer_index++] = low_nibble > 9 ? ('A' + low_nibble - 10) : ('0' + low_nibble);
+
+        // Add a space separator between bytes (optional)
+        if (i < length - 1) {
+            output_buffer[buffer_index++] = ' ';
+        }
+    }
+
+    // Null-terminate the string
+    output_buffer[buffer_index] = '\0';
+}
+
+// Function to halt the card after reading
+void PICC_HaltA() {
+    unsigned char command[2] = {PICC_HALT, 0x00};
+    unsigned char result[1];
+    unsigned char resultSize = sizeof(result);
+
+    PCD_CommunicateWithPICC(PCD_TRANSCEIVE, 0x30, command, 2, result, &resultSize, 0);
+}
+
+// Add this as a separate function
+void PCD_AntennaOn() {
+    unsigned char value = readRegister(MFRC522_REG_TX_CONTROL);
+    alt_printf("Current TX_CONTROL value: 0x%02X\n", value);
+
+    if ((value & 0x03) != 0x03) {
+        alt_printf("Setting antenna bits...\n");
+        writeRegister(MFRC522_REG_TX_CONTROL, value | 0x03);
+        usleep(1000);  // Give it time to settle
+    }
+
+    // Verify
+    value = readRegister(MFRC522_REG_TX_CONTROL);
+
+    if ((value & 0x03) != 0x03) {
+        alt_printf("Warning: Antenna did not turn on! TX_CONTROL=0x%02X\n", value);
+    } else {
+        alt_printf("Antenna successfully enabled\n");
+    }
+}
+
+// Add this function too
+void PCD_AntennaOff() {
+    PCD_ClearRegisterBitMask(MFRC522_REG_TX_CONTROL, 0x03);
+}
+
+void ultrasonic_init() {
+    // Ensure trigger pin is LOW initially
+    IOWR(HC_OUT_BASE, 0, 0);
+}
+
+// Function to send a trigger pulse
+void send_trigger_pulse() {
+    IOWR(HC_OUT_BASE, 0, 1);           // Set Trigger HIGH
+    usleep(TRIGGER_PULSE_WIDTH);      // Wait for the pulse width
+    IOWR(HC_OUT_BASE, 0, 0);           // Set Trigger LOW
+}
+
+// Function to measure echo pulse width using usleep
+alt_u32 measure_echo_pulse() {
+    long timeout = TIMEOUT_THRESHOLD;  // Timeout threshold to prevent infinite loop
+
+    // Wait for Echo pin to go HIGH (start of pulse)
+    while (IORD(HC_IN_BASE, 0) == 0 && timeout--) {
+        usleep(1);  // Check the Echo pin every microsecond
+    }
+
+    if (timeout <= 0) {
+        alt_printf("Timeout: Echo pin did not go HIGH.\n");
+        return 0;  // Timeout occurred
+    }
+
+    // Record start time by counting loop iterations
+    alt_u32 start_time = 0;
+    start_time = 0;
+
+    // Wait for Echo pin to go LOW (end of pulse)
+    while (IORD(HC_IN_BASE, 0) == 1 && timeout--) {
+        usleep(1);  // Check the Echo pin every microsecond
+        start_time++;
+    }
+
+    if (timeout <= 0) {
+        alt_printf("Timeout: Echo pin did not go LOW.\n");
+        return 0;  // Timeout occurred
+    }
+
+    // Return the pulse duration in microseconds
+    return start_time; // Return the pulse width based on loop iterations
+}
+
+int main() {
+	// Initialize variables properly
+	int accumulated_error = 0;
+	uint64_t distance = 0;
+	uint64_t pulse_duration = 0;  // Example pulse duration (should be set appropriately)
+	char password[5] = {0};  // Buffer for entered passwords
+	char oldPassword[4] = {1};      // Buffer for the new password
+	char pressedKey;
+	size_t id_length = sizeof(uid) / sizeof(uid[0]);
+	char hex_string[3 * id_length];
+
+	key_irq_init(); // Enable interrupt
+	alt_printf("Display printed on monitor\n");
+	alt_printf("4X4 Keypad Initialization ... \n");
+	alt_putstr("Starting Bluetooth HC-06 communication...\n");
+	uart_send_string("\nSystem begin!\n"); // Send a test string to the HC-05 module
+	alt_printf("Initializing RFID Reader...\n");
+	PCD_Init();
+	ultrasonic_init(); // initialize ultrasonic sensor
+
+	while (1){
+		ppl_status = 0;
+		// Send a trigger pulse
+		send_trigger_pulse();
+
+		// Measure the echo pulse width
+		pulse_duration = measure_echo_pulse();
+		alt_printf("Ultrasonic_Sensor Activated!!!");
+		set_vga_colors(0xF, 0x0); // White text (0xF) on black background (0x0)
+		clear_vga_fullscreen(); // Clear the screen
+
+		if (pulse_duration > 0) {
+			distance = pulse_duration * 1;
+
+			if(distance <= 20){
+				alt_printf("People detected");  // Print as integer with decimal
+				while(1){
+					clear_vga_fullscreen(); // Clear the screen
+					enable_frame(); // Display Frame enable
+					welcoming_screen();
+					if (ppl_status)
+						break;
+
+					while (1) {
+						// Send a trigger pulse
+						send_trigger_pulse();
+
+						// Measure the echo pulse width
+						pulse_duration = measure_echo_pulse();
+						for (row = 0; row < 4; row++) {
+							// Set the current row to LOW (active)
+							IOWR_ALTERA_AVALON_PIO_DATA(KEYPAD_ROW_BASE, ~(1 << row));
+
+							// Read the column states
+							alt_u32 colState = IORD_ALTERA_AVALON_PIO_DATA(KEYPAD_COLUMN_BASE);
+
+							for (col = 0; col < 4; col++) {
+								// Check if the current column is LOW (key pressed)
+								if ((colState & (1 << col)) == 0) {
+									usleep(50000); // Debounce delay
+
+									// Wait for the key to be released
+									while ((IORD_ALTERA_AVALON_PIO_DATA(KEYPAD_COLUMN_BASE) & (1 << col)) == 0);
+
+									// Reset the rows to default (all HIGH)
+									IOWR_ALTERA_AVALON_PIO_DATA(KEYPAD_ROW_BASE, 0xF);
+
+									pressedKey = keyMap[row][col];
+								}
+							}
+						}
+
+						if (pulse_duration > 0)
+							distance = pulse_duration * 1;
+							if(distance >= 80){
+								accumulated_error = accumulated_error + 10;
+								alt_printf("\nNo ppl\n");
+							}
+
+							if(accumulated_error >= 100){
+								ppl_status = 1;
+								accumulated_error = 0;
+								break;
+							}
+
+						if (PICC_IsNewCardPresent()) {
+							alt_printf("Card detected!\n");
+							PICC_ReadCardSerial();                    //get uid
+							store_hex_id(uid, id_length, hex_string);
+							alt_printf("New Card UID: ");
+							uart_send_string("\nNew Card UID: ");
+							uart_send_string(hex_string);
+							alt_printf("RFID Card ID: %s\n", hex_string);
+							clear_vga_screen();
+							rfid_id_screen(hex_string);
+							usleep(1000000);
+							if(compareRFID(uid)== 0){
+								rfid_not_match_screen();
+								usleep(2000000);
+								break;
+							}
+						}
+
+						if (pressedKey == '*'){
+							alt_printf("\nPassword entry\n");
+							clear_vga_screen();
+							keyin_pass_screen(0);
+							inputPassword(oldPassword,1);
+							if (comparePasswords(password, oldPassword) == 0){
+								pass_fail_screen();
+								pressedKey = "0/";
+								usleep(2000000);
+								break;
+							}
+						}
+
+						if (compareRFID(uid) || comparePasswords(password, oldPassword)){
+							accumulated_error = 0;
+
+							for (i = 0; i < 4; i++) {
+								uid[i] = 0;
+							}
+
+							for (i = 0; i < 4; i++) {
+								oldPassword[i] = 0;
+							}
+
+							clear_vga_screen();
+							open_pass_screen();
+							pressedKey = scanKeypad();
+							alt_printf("Key Pressed: %c\n",pressedKey);
+							if (pressedKey == 'A'){ //Open Locker
+								clear_vga_screen();
+								locker_open_screen();
+								uart_send_string("\nLibrary Locker Opened\n");
+								IOWR_ALTERA_AVALON_PIO_DATA(LOCKER_STATUS, 0xFF);
+								usleep(3000000);
+								IOWR_ALTERA_AVALON_PIO_DATA(LOCKER_STATUS, 0x00);
+								break;
+							}
+
+							if (pressedKey == 'B'){ // Set / Reset Password
+								clear_vga_screen();
+								set_reset_screen();
+								usleep(1000000);
+
+								pressedKey = scanKeypad();
+								alt_printf("Key Pressed: %c\n",pressedKey);
+								if (pressedKey == 'A'){	// Set Password
+									clear_vga_screen();
+									keyin_pass_screen(0);
+									inputPassword(password,1);
+									alt_printf("\nPassword saved: %s\n", password);
+									uart_send_string("\nNew Password saved: ");
+									uart_send_string(password);
+									usleep(1000000);
+									clear_vga_screen();
+									pass_set_screen();
+									usleep(1000000);
+									break;
+								}
+
+								if (pressedKey == 'B'){ // Reset Password
+									clear_vga_screen();
+									oldpass_screen(0);
+									inputPassword(oldPassword,2);
+									usleep(1000000);
+									if (comparePasswords(password, oldPassword)) {
+										clear_vga_screen();
+										keyin_newpass_screen(0);
+										alt_printf("Old password is correct.\n");
+										alt_printf("Enter new password:\n");
+										password[4] = '\0';
+										inputPassword(password,3);
+										alt_printf("\nReset Password saved: %s\n", password);
+										uart_send_string("\nReset Password saved: ");
+										uart_send_string(password);
+										alt_printf("Password has been reset successfully.\n");
+										uart_send_string("\nPassword has been reset successfully.\n");
+										usleep(1000000);
+										break;
+									}
+									else{
+										clear_vga_screen();
+										pass_fail_screen();
+										usleep(3000000);
+										break;
+									}
+
+							   }
+
+								if (pressedKey == 'C')
+									break;
+
+							}
+							if (pressedKey == 'C'){ // Set / Reset Password
+								break;
+							}
+						}
+					}
+				}
+			}else{
+				alt_printf("Not Detected!");
+			}
+		}
+		usleep(100000);
+
+	}
+
+	return 0;
+}
