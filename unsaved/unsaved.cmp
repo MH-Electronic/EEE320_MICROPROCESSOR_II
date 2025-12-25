@@ -1,0 +1,17 @@
+	component unsaved is
+		port (
+			clk_clk            : in  std_logic                    := 'X';             -- clk
+			reset_reset_n      : in  std_logic                    := 'X';             -- reset_n
+			switches_export    : in  std_logic_vector(7 downto 0) := (others => 'X'); -- export
+			leds_export        : out std_logic_vector(7 downto 0);                    -- export
+			vga_external_CLK   : out std_logic;                                       -- CLK
+			vga_external_HS    : out std_logic;                                       -- HS
+			vga_external_VS    : out std_logic;                                       -- VS
+			vga_external_BLANK : out std_logic;                                       -- BLANK
+			vga_external_SYNC  : out std_logic;                                       -- SYNC
+			vga_external_R     : out std_logic_vector(7 downto 0);                    -- R
+			vga_external_G     : out std_logic_vector(7 downto 0);                    -- G
+			vga_external_B     : out std_logic_vector(7 downto 0)                     -- B
+		);
+	end component unsaved;
+
